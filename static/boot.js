@@ -2159,11 +2159,12 @@ function clearPreview(opts={}){
   const pa=$('previewArea');if(pa)pa.classList.remove('visible');
   const pi=$('previewImg');if(pi){pi.onerror=null;pi.src='';}
   const pdf=$('previewPdfFrame');if(pdf)pdf.src='';
-  const html=$('previewHtmlIframe');if(html)html.src='';
-  // [AIP] cancel in-flight blob frame fetches + release the object URL
-  // (both defined in workspace.js)
+  const html=$('previewHtmlIframe');if(html){html.src='';html.removeAttribute('srcdoc');}
+  // [AIP] cancel in-flight preview fetches, release the blob object URL, and
+  // tear down the pdf.js canvas document (all defined in workspace.js)
   if(typeof _invalidateFramePreviews==='function')_invalidateFramePreviews();
   if(typeof _revokePreviewObjectUrl==='function')_revokePreviewObjectUrl();
+  if(typeof _teardownPdfCanvasPreview==='function')_teardownPdfCanvasPreview();
   const pm=$('previewMd');if(pm)pm.innerHTML='';
   const pc=$('previewCode');if(pc)pc.textContent='';
   const pp=$('previewPathText');if(pp)pp.textContent='';

@@ -1104,11 +1104,9 @@ async function openFile(path, opts={}){
   } else if(PDF_EXTS.has(ext)){
     showPreview('pdf');
     const frame=$('previewPdfFrame');
-    if(frame){
-      frame.title=`PDF preview: ${path.split('/').pop()||path}`;
-      // [AIP] blob: preview — frame-blocking proxy headers can't reach it.
-      _framePreviewViaBlob(frame, path, {inline:true}, cacheBust);
-    }
+    if(frame) frame.title=`PDF preview: ${path.split('/').pop()||path}`;
+    // [AIP] canvas rendering — immune to frame-blocking proxy headers/CSP.
+    _pdfPreviewViaPdfjs(path, cacheBust);
   } else if(MD_EXTS.has(ext)){
     // Markdown: fetch text, render with renderMd, display as formatted HTML
     try{
@@ -1143,9 +1141,9 @@ async function openFile(path, opts={}){
     showPreview('html');
     const iframe=$('previewHtmlIframe');
     if(iframe){
-      // [AIP] blob: preview — frame-blocking proxy headers can't reach it;
-      // ?inline=1 still applies the <base target="_blank"> link rewrite.
-      _framePreviewViaBlob(iframe, path, {inline:true}, cacheBust);
+      // [AIP] srcdoc preview — immune to frame-blocking headers AND to the
+      // embedder-CSP frame-src that blocks blob:/URL navigation.
+      _htmlPreviewViaSrcdoc(iframe, path, cacheBust);
     }
   } else if(ext==='.csv'){
     try{
@@ -1213,6 +1211,113 @@ function _invalidateFramePreviews(){
   // frame after the user has moved on (different file type or closed pane).
   _framePreviewSeq++;
 }
+async function _htmlPreviewViaSrcdoc(iframe, path, cacheBust){
+  // [AIP] HTML preview via srcdoc: no URL is navigated, so neither the framed
+  // response's XFO/frame-ancestors nor the EMBEDDING page's CSP frame-src can
+  // block it (the AIP edge stamps `frame-src 'self'`, which rejects blob: —
+  // that is why the blob variant showed "This content is blocked"). The
+  // sandbox attribute stays → opaque origin, isolation unchanged. ?inline=1
+  // keeps the server's <base target="_blank"> link rewrite.
+  const url=_workspaceRouteForPath(path, 'raw', {inline:true}) + (cacheBust||'');
+  const myReq=++_framePreviewSeq;
+  iframe.removeAttribute('srcdoc');
+  iframe.src='about:blank'; // clear stale content
+  try{
+    const resp=await fetch(url, {credentials:'same-origin'});
+    if(!resp.ok) throw new Error('HTTP '+resp.status);
+    const text=await resp.text();
+    if(myReq!==_framePreviewSeq) return;
+    iframe.removeAttribute('src');
+    iframe.srcdoc=text;
+  }catch(_e){
+    // Legacy fallback: frame the raw URL directly (works where no
+    // frame-blocking headers are injected).
+    if(myReq===_framePreviewSeq) iframe.src=url;
+  }
+}
+
+// [AIP] PDF preview via pdf.js onto canvases: framing a PDF URL is blocked by
+// the edge's XFO/frame-ancestors, blob: frames by its CSP frame-src 'self',
+// and <object>/<embed> by object-src 'none' — canvas rendering involves no
+// frame at all. pdf.js is vendored into static/vendor/pdfjs at image build.
+let _pdfjsModulePromise=null;
+let _pdfCanvasDoc=null;
+const _PDF_CANVAS_MAX_PAGES=300;
+function _pdfjsAssetUrl(rel){
+  const base=(typeof document!=='undefined'&&document.baseURI)||'';
+  try{ return base?new URL(rel, base).href:rel; }catch(_e){ return rel; }
+}
+function _loadPdfjs(){
+  if(!_pdfjsModulePromise){
+    _pdfjsModulePromise=import(_pdfjsAssetUrl('static/vendor/pdfjs/pdf.min.mjs')).then(mod=>{
+      mod.GlobalWorkerOptions.workerSrc=_pdfjsAssetUrl('static/vendor/pdfjs/pdf.worker.min.mjs');
+      return mod;
+    });
+    _pdfjsModulePromise.catch(()=>{_pdfjsModulePromise=null;});
+  }
+  return _pdfjsModulePromise;
+}
+function _teardownPdfCanvasPreview(){
+  if(_pdfCanvasDoc){ try{_pdfCanvasDoc.destroy();}catch(_e){} _pdfCanvasDoc=null; }
+  const box=$('previewPdfCanvas'); if(box) box.innerHTML='';
+}
+async function _pdfPreviewViaPdfjs(path, cacheBust){
+  const frame=$('previewPdfFrame');
+  const box=$('previewPdfCanvas');
+  const myReq=++_framePreviewSeq;
+  _teardownPdfCanvasPreview();
+  if(!box){
+    // Old markup without the canvas container: keep the frame behavior.
+    if(frame) _framePreviewViaBlob(frame, path, {inline:true}, cacheBust);
+    return;
+  }
+  if(frame){frame.style.display='none';frame.src='';}
+  box.style.display='';
+  box.innerHTML='<div style="padding:20px;text-align:center;opacity:.7">Loading PDF…</div>';
+  try{
+    const url=_workspaceRouteForPath(path, 'raw', {inline:true}) + (cacheBust||'');
+    const [pdfjs, resp]=await Promise.all([
+      _loadPdfjs(),
+      fetch(url, {credentials:'same-origin'}),
+    ]);
+    if(!resp.ok) throw new Error('HTTP '+resp.status);
+    const data=await resp.arrayBuffer();
+    if(myReq!==_framePreviewSeq) return;
+    const doc=await pdfjs.getDocument({data}).promise;
+    if(myReq!==_framePreviewSeq){ try{doc.destroy();}catch(_e){} return; }
+    _pdfCanvasDoc=doc;
+    box.innerHTML='';
+    const pages=Math.min(doc.numPages, _PDF_CANVAS_MAX_PAGES);
+    const cssWidth=Math.max(280, (box.clientWidth||800)-16);
+    const dpr=(typeof window!=='undefined'&&window.devicePixelRatio)||1;
+    for(let i=1;i<=pages;i++){
+      if(myReq!==_framePreviewSeq||_pdfCanvasDoc!==doc) return;
+      const page=await doc.getPage(i);
+      if(myReq!==_framePreviewSeq||_pdfCanvasDoc!==doc) return;
+      const base=page.getViewport({scale:1});
+      const viewport=page.getViewport({scale:(cssWidth/base.width)*dpr});
+      const canvas=document.createElement('canvas');
+      canvas.width=Math.floor(viewport.width);
+      canvas.height=Math.floor(viewport.height);
+      canvas.style.cssText=`display:block;width:${cssWidth}px;margin:0 auto 8px;background:#fff;border-radius:4px`;
+      box.appendChild(canvas);
+      await page.render({canvasContext:canvas.getContext('2d'), viewport}).promise;
+    }
+    if(doc.numPages>pages){
+      const note=document.createElement('div');
+      note.style.cssText='padding:12px;text-align:center;opacity:.7;font-size:12px';
+      note.textContent=`Showing the first ${pages} of ${doc.numPages} pages — use Download for the full document.`;
+      box.appendChild(note);
+    }
+  }catch(_e){
+    if(myReq!==_framePreviewSeq) return;
+    // pdf.js missing or render failure → legacy frame (blob → direct URL).
+    _teardownPdfCanvasPreview();
+    box.style.display='none';
+    if(frame){frame.style.display='';_framePreviewViaBlob(frame, path, {inline:true}, cacheBust);}
+  }
+}
+
 async function _framePreviewViaBlob(frame, path, opts, cacheBust){
   const url=_workspaceRouteForPath(path, 'raw', opts) + (cacheBust||'');
   const myReq=++_framePreviewSeq;

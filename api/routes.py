@@ -16542,6 +16542,9 @@ def handle_put(handler, parsed) -> bool:
 _STATIC_MIME = {
     "css": "text/css",
     "js": "application/javascript",
+    # ES modules (vendored pdf.js): browsers enforce strict MIME for module
+    # imports — the text/plain map default would hard-fail the import.
+    "mjs": "application/javascript",
     "html": "text/html",
     "svg": "image/svg+xml",
     "png": "image/png",
