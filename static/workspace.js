@@ -1081,6 +1081,8 @@ async function openFile(path, opts={}){
 
   _previewCurrentPath = path;
   renderFileBreadcrumb(path);
+  // [AIP] any new preview supersedes in-flight blob frame fetches
+  if(typeof _invalidateFramePreviews==='function')_invalidateFramePreviews();
   if(IMAGE_EXTS.has(ext)){
     // Image: load via raw endpoint, show as <img>
     showPreview('image');
@@ -1101,12 +1103,11 @@ async function openFile(path, opts={}){
     }
   } else if(PDF_EXTS.has(ext)){
     showPreview('pdf');
-    const url=_workspaceRouteForPath(path, 'raw', {inline:true}) + cacheBust;
     const frame=$('previewPdfFrame');
     if(frame){
-      frame.src=''; // clear first to avoid stale content
-      frame.src=url;
       frame.title=`PDF preview: ${path.split('/').pop()||path}`;
+      // [AIP] blob: preview — frame-blocking proxy headers can't reach it.
+      _framePreviewViaBlob(frame, path, {inline:true}, cacheBust);
     }
   } else if(MD_EXTS.has(ext)){
     // Markdown: fetch text, render with renderMd, display as formatted HTML
@@ -1140,11 +1141,11 @@ async function openFile(path, opts={}){
     // or reading other origin data. If a stricter mode is needed, remove
     // allow-scripts (or add sandbox="") to disable all JS execution.
     showPreview('html');
-    const url=_workspaceRouteForPath(path, 'raw', {inline:true}) + cacheBust;
     const iframe=$('previewHtmlIframe');
     if(iframe){
-      iframe.src=''; // clear first to avoid stale content
-      iframe.src=url;
+      // [AIP] blob: preview — frame-blocking proxy headers can't reach it;
+      // ?inline=1 still applies the <base target="_blank"> link rewrite.
+      _framePreviewViaBlob(iframe, path, {inline:true}, cacheBust);
     }
   } else if(ext==='.csv'){
     try{
@@ -1186,6 +1187,53 @@ async function openFile(path, opts={}){
       // If it's a 400/too-large error, offer download instead
       downloadFile(path);
     }
+  }
+}
+
+// ── [AIP] Blob-based frame previews ───────────────────────────────────────
+// Reverse proxies in front of the app can stamp `X-Frame-Options: DENY` /
+// CSP `frame-ancestors 'none'` on EVERY response (the AIP REANA edge does),
+// which blocks framing /api/file/raw URLs even same-origin — the pdf/html
+// preview panes then show the browser's "refused to connect" page. fetch()
+// is exempt from frame policies and blob: documents carry no HTTP headers,
+// so fetch the bytes and hand the frame a local object URL instead. The HTML
+// iframe keeps its sandbox attribute: blob + sandbox (without
+// allow-same-origin) is an opaque origin, the same isolation the server-side
+// ?inline=1 CSP sandbox provides for direct opens of the URL.
+let _previewObjectUrl=null;
+let _framePreviewSeq=0;
+function _revokePreviewObjectUrl(){
+  if(_previewObjectUrl){
+    try{URL.revokeObjectURL(_previewObjectUrl);}catch(_e){}
+    _previewObjectUrl=null;
+  }
+}
+function _invalidateFramePreviews(){
+  // Supersede any in-flight blob fetch so a slow response can't land in a
+  // frame after the user has moved on (different file type or closed pane).
+  _framePreviewSeq++;
+}
+async function _framePreviewViaBlob(frame, path, opts, cacheBust){
+  const url=_workspaceRouteForPath(path, 'raw', opts) + (cacheBust||'');
+  const myReq=++_framePreviewSeq;
+  frame.src=''; // clear first to avoid stale content
+  try{
+    const resp=await fetch(url, {credentials:'same-origin'});
+    if(!resp.ok) throw new Error('HTTP '+resp.status);
+    const blob=await resp.blob();
+    const objectUrl=URL.createObjectURL(blob);
+    if(myReq!==_framePreviewSeq){
+      // A newer preview superseded this fetch — drop the stale result.
+      try{URL.revokeObjectURL(objectUrl);}catch(_e){}
+      return;
+    }
+    _revokePreviewObjectUrl();
+    _previewObjectUrl=objectUrl;
+    frame.src=objectUrl;
+  }catch(_e){
+    // Fall back to framing the raw URL directly (pre-blob behavior) — works
+    // wherever no frame-blocking headers are injected.
+    if(myReq===_framePreviewSeq) frame.src=url;
   }
 }
 

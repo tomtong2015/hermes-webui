@@ -2160,6 +2160,10 @@ function clearPreview(opts={}){
   const pi=$('previewImg');if(pi){pi.onerror=null;pi.src='';}
   const pdf=$('previewPdfFrame');if(pdf)pdf.src='';
   const html=$('previewHtmlIframe');if(html)html.src='';
+  // [AIP] cancel in-flight blob frame fetches + release the object URL
+  // (both defined in workspace.js)
+  if(typeof _invalidateFramePreviews==='function')_invalidateFramePreviews();
+  if(typeof _revokePreviewObjectUrl==='function')_revokePreviewObjectUrl();
   const pm=$('previewMd');if(pm)pm.innerHTML='';
   const pc=$('previewCode');if(pc)pc.textContent='';
   const pp=$('previewPathText');if(pp)pp.textContent='';
