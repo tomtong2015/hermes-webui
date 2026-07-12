@@ -228,6 +228,23 @@ function _workspacePathIsReadOnly(path){
 }
 
 function _workspaceRouteForPath(path, kind, opts={}){
+  // AIP: resolve the route against document.baseURI so URLs that bypass api()
+  // (previewImg.src, media/pdf/html frame src, download anchors, window.open)
+  // keep working on subpath mounts like /<pod>/hermes/ — a bare "/api/…" string
+  // resolves to the proxy root there and 404s. api() strips the leading slash
+  // and re-resolves itself, so callers that go through api() are unaffected by
+  // receiving an already-absolute URL.
+  const route=_workspaceRouteForPathRel(path, kind, opts);
+  if(!route) return route;
+  // Non-browser harnesses (Node-based tests) have no document/location: keep
+  // the app-relative form there.
+  const base=(typeof document!=='undefined'&&document.baseURI)||(typeof location!=='undefined'&&location.href)||'';
+  if(!base||!/^https?:\/\//i.test(base)) return route;
+  const rel=route.startsWith('/') ? route.slice(1) : route;
+  return new URL(rel, base).href;
+}
+
+function _workspaceRouteForPathRel(path, kind, opts={}){
   if(!S.session) return '';
   const normalizedPath = _normalizeWorkspaceRelPath(path);
   const grant = _workspaceEscapeGrantForPath(normalizedPath);

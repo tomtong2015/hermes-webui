@@ -12326,12 +12326,55 @@ def handle_get(handler, parsed) -> bool:
             return True
         from api.runtime_adapter import LegacyJournalRuntimeAdapter, runtime_adapter_enabled
 
+        # AIP Full Stop: resolve the owning session BEFORE cancel_stream tears
+        # the stream registries down, so Stop can also end the session's other
+        # active runs (server-side wakeup ghosts), its background processes,
+        # and every queued/deferred wakeup — not just the visible stream.
+        from api import config as _cfg
+
+        session_id = str(_cfg.stream_owner_session_id(stream_id) or "")
+        sibling_streams: list = []
+        try:
+            with _cfg.ACTIVE_RUNS_LOCK:
+                if not session_id:
+                    entry = (_cfg.ACTIVE_RUNS or {}).get(stream_id) or {}
+                    session_id = str(entry.get("session_id") or "").strip()
+                if session_id:
+                    sibling_streams = [
+                        sid
+                        for sid, meta in (_cfg.ACTIVE_RUNS or {}).items()
+                        if sid != stream_id
+                        and isinstance(meta, dict)
+                        and str(meta.get("session_id") or "") == session_id
+                    ]
+        except Exception:
+            pass
+
         if runtime_adapter_enabled():
             adapter = LegacyJournalRuntimeAdapter(cancel_delegate=cancel_stream)
             cancelled = adapter.cancel_run(stream_id).accepted
         else:
             cancelled = cancel_stream(stream_id)
-        return j(handler, {"ok": True, "cancelled": cancelled, "stream_id": stream_id})
+
+        full_stop_summary: dict = {}
+        for _sib in sibling_streams:
+            try:
+                cancel_stream(_sib)
+            except Exception:
+                pass
+        if session_id:
+            try:
+                from api.background_process import full_stop_session
+
+                full_stop_summary = full_stop_session(session_id)
+            except Exception:
+                logging.getLogger(__name__).warning(
+                    "full_stop_session failed for %s", session_id, exc_info=True
+                )
+        payload = {"ok": True, "cancelled": cancelled, "stream_id": stream_id}
+        if full_stop_summary:
+            payload["full_stop"] = full_stop_summary
+        return j(handler, payload)
 
     if parsed.path == "/api/chat/stream":
         return _handle_sse_stream(handler, parsed)
@@ -16958,7 +17001,7 @@ def _serve_inline_html_preview(handler, target: Path, cache_control: str, *, csp
     return True
 
 
-_MEDIA_TOKEN_RE = re.compile(r"MEDIA:([^\s\)\]]+)")
+_MEDIA_TOKEN_RE = re.compile(r"<?MEDIA:([^\s\)\]>]+)>?")
 
 
 def _message_content_text(content) -> str:
