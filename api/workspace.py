@@ -7,6 +7,7 @@ profile has its own workspace configuration.  State files live at
 ``{profile_home}/webui_state/last_workspace.txt``.  The global STATE_DIR
 paths are used as fallback when no profile module is available.
 """
+import functools
 import hashlib
 import json
 import logging
@@ -482,6 +483,143 @@ _USER_TMP_PREFIXES: tuple[Path, ...] = (
 )
 
 
+@functools.lru_cache(maxsize=8)
+def _parse_extra_workspace_roots(raw: str) -> tuple[tuple[Path, Path], ...]:
+    """Parse the env value into ``(expanded, resolved)`` root pairs; cached so
+    warnings fire once.
+
+    ``expanded`` is the literal entry after ``~`` expansion; ``resolved`` is its
+    symlink-resolved canonical form. Both are kept because the POSIX probe matches
+    against *raw* (unresolved) input strings: on macOS ``/var`` is a symlink to
+    ``/private/var`` so a ``/var/reana`` entry resolves to ``/private/var/reana``
+    and would miss a literal ``/var/reana/...`` candidate — the static
+    ``_USER_TMP_PREFIXES`` list dodges this by carrying both forms, and the dynamic
+    roots must do the same.
+
+    This widens a security boundary via deployment config, so entries are
+    validated rather than trusted blindly: each must be absolute (after
+    ``~`` expansion), resolvable, and bounded (it must sit *strictly below* a
+    blocked system root — see below). A bad entry is skipped with a logged
+    warning instead of the old silent ``except: pass`` — a misconfigured value
+    surfaces (as a log line) rather than silently failing to carve out and
+    leaving the operator with a confusing "still blocked".
+
+    The boundedness check matters because ``Path.resolve()`` collapses ``..``:
+    without it a value like ``/var/reana/..`` (resolves to ``/var``) or
+    ``/var/reana/../..`` (resolves to ``/``) would silently turn a whole system
+    root — up to the entire filesystem — into a trusted workspace root. So an
+    entry is also skipped when it contains ``..`` components, resolves to a
+    filesystem root, or is equal to / a parent of any blocked system root.
+    """
+    out: list[tuple[Path, Path]] = []
+    for part in raw.split(os.pathsep):
+        part = part.strip()
+        if not part:
+            continue
+        expanded = os.path.expanduser(part)
+        if not os.path.isabs(expanded):
+            logger.warning(
+                "Ignoring non-absolute HERMES_WEBUI_EXTRA_WORKSPACE_ROOTS entry %r "
+                "(workspace roots must be absolute paths)",
+                part,
+            )
+            continue
+        # Reject '..' components up front: Path.resolve() would collapse them,
+        # so a value like '/var/reana/..' would otherwise sneak past the
+        # below-a-blocked-root check by resolving to a broader prefix.
+        if ".." in Path(expanded).parts:
+            logger.warning(
+                "Ignoring HERMES_WEBUI_EXTRA_WORKSPACE_ROOTS entry %r: '..' path "
+                "components are not allowed (give a fully-resolved absolute path)",
+                part,
+            )
+            continue
+        try:
+            resolved = Path(expanded).resolve()
+        except Exception as exc:  # pragma: no cover - resolve() edge cases
+            logger.warning(
+                "Ignoring unresolvable HERMES_WEBUI_EXTRA_WORKSPACE_ROOTS entry %r: %s",
+                part,
+                exc,
+            )
+            continue
+        if resolved == Path(resolved.anchor):
+            logger.warning(
+                "Ignoring HERMES_WEBUI_EXTRA_WORKSPACE_ROOTS entry %r: a filesystem "
+                "root is too broad to be a trusted workspace root",
+                part,
+            )
+            continue
+        # A configured root must sit strictly below a blocked system root, never
+        # be one of them or an ancestor of one — otherwise the carve-out would
+        # unblock the whole system root (e.g. a bare '/var', or '/' as the parent
+        # of every blocked root).
+        if any(
+            resolved == blocked or resolved in blocked.parents
+            for blocked in _workspace_blocked_roots()
+        ):
+            logger.warning(
+                "Ignoring HERMES_WEBUI_EXTRA_WORKSPACE_ROOTS entry %r (resolves to "
+                "%s): equal to or a parent of a blocked system root; a workspace "
+                "root must sit strictly below one",
+                part,
+                resolved,
+            )
+            continue
+        out.append((Path(expanded), resolved))
+    return tuple(out)
+
+
+def _extra_workspace_root_pairs() -> tuple[tuple[Path, Path], ...]:
+    """``(expanded, resolved)`` pairs for the configured extra workspace roots."""
+    raw = os.environ.get("HERMES_WEBUI_EXTRA_WORKSPACE_ROOTS", "").strip()
+    if not raw:
+        return ()
+    return _parse_extra_workspace_roots(raw)
+
+
+def _extra_workspace_posix_carveouts() -> tuple[PurePosixPath, ...]:
+    """Both POSIX forms (expanded + resolved) of each extra root, deduped.
+
+    The POSIX probe (``_is_blocked_posix_workspace_path``) matches against raw,
+    *unresolved* path strings, so it needs the literal form as well as the
+    symlink-resolved one — mirroring the static ``/var/folders`` +
+    ``/private/var/folders`` pattern so a ``/var/reana`` carve-out works on macOS
+    where ``/var`` is a symlink to ``/private/var``.
+    """
+    out: list[PurePosixPath] = []
+    seen: set[str] = set()
+    for expanded, resolved in _extra_workspace_root_pairs():
+        for form in (expanded, resolved):
+            posix = form.as_posix()
+            if posix not in seen:
+                seen.add(posix)
+                out.append(PurePosixPath(posix))
+    return tuple(out)
+
+
+def _extra_workspace_prefixes() -> tuple[Path, ...]:
+    """Deployment-provided workspace-root carve-outs.
+
+    ``HERMES_WEBUI_EXTRA_WORKSPACE_ROOTS`` (os.pathsep-separated absolute paths)
+    whitelists legitimate workspace roots that nominally sit under a blocked
+    system prefix. REANA, for example, mounts each user's persistent workspace
+    under ``/var/reana/users/<uid>/workflows/<id>/`` — without this carve-out it
+    is rejected as a ``/var`` system path and session creation 400s. Entries are
+    validated and parsed by ``_parse_extra_workspace_roots``.
+
+    Returns the symlink-resolved form of each root (used by the ``Path``-based
+    gates, whose candidates are themselves resolved). The POSIX probe, which sees
+    raw strings, uses ``_extra_workspace_posix_carveouts`` for both forms.
+    """
+    return tuple(resolved for _expanded, resolved in _extra_workspace_root_pairs())
+
+
+def _workspace_carveout_prefixes() -> tuple[Path, ...]:
+    """User-tmp carve-outs plus any deployment-provided extra workspace roots."""
+    return _USER_TMP_PREFIXES + _extra_workspace_prefixes()
+
+
 def _workspace_blocked_roots() -> tuple[Path, ...]:
     """System roots that must never be accepted as workspace candidates.
 
@@ -531,12 +669,20 @@ def _is_blocked_posix_workspace_path(raw_path: str | Path | None) -> bool:
         return False
     if candidate == PurePosixPath('/'):
         return True
-    carveouts = (
+    carveouts = [
         PurePosixPath('/var/folders'),
         PurePosixPath('/private/var/folders'),
         PurePosixPath('/var/tmp'),
         PurePosixPath('/private/var/tmp'),
-    )
+    ]
+    # Deployment-provided workspace roots (HERMES_WEBUI_EXTRA_WORKSPACE_ROOTS) are
+    # carved out here too — this POSIX probe runs first in _is_blocked_workspace_path,
+    # so without it a legitimate workspace under an otherwise-blocked system prefix
+    # (e.g. REANA's /var/reana/...) is rejected on the validate/resolve path even
+    # though _is_blocked_system_path honors the carve-out. Both the literal and the
+    # symlink-resolved form are added (macOS /var -> /private/var) since this probe
+    # matches against the raw, unresolved input string.
+    carveouts += list(_extra_workspace_posix_carveouts())
     for tmp in carveouts:
         if _posix_is_within(candidate, tmp):
             return False
@@ -571,7 +717,7 @@ def _is_blocked_system_path(candidate: Path) -> bool:
     nominally under ``/var`` (``/var/folders`` on macOS, ``/var/tmp`` on
     Linux/macOS) remain valid workspace candidates and reachable file targets.
     """
-    for tmp in _USER_TMP_PREFIXES:
+    for tmp in _workspace_carveout_prefixes():
         if _is_within(candidate, tmp):
             return False
     for blocked in _workspace_blocked_roots():
@@ -630,7 +776,7 @@ def _is_blocked_workspace_path(candidate: Path, raw_path: str | Path | None = No
     if candidate in exact or (raw is not None and raw in _workspace_blocked_roots()):
         return True
 
-    for tmp in _USER_TMP_PREFIXES:
+    for tmp in _workspace_carveout_prefixes():
         if _is_within(candidate, tmp) or (raw is not None and _is_within(raw, tmp)):
             return False
 

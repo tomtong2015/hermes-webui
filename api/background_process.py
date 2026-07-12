@@ -945,6 +945,14 @@ def _process_one(evt: dict) -> None:
         session_key_resolved_sid=session_id,
         proc_session=_ps_xs,
     )
+    # AIP Full Stop: a user Stop inside the grace window silences completions
+    # that were already dequeued by this drain thread when the stop landed —
+    # the queue purge in full_stop_session cannot reach an in-flight event.
+    if _recently_full_stopped(session_id):
+        logger.info(
+            "process_complete dropped: session %s was full-stopped", session_id
+        )
+        return
     # ── Idempotency vs the REAL merged upstream #2279 (shared dedupe key) ──
     # The real merged #2279 next-turn drain
     # (api/streaming._drain_webui_process_notifications) dedupes ONLY via
@@ -1115,6 +1123,101 @@ def claim_deferred_wakeups(session_id: str) -> list[dict]:
         return []
 
 
+# ── AIP Full Stop ───────────────────────────────────────────────────────────
+# The Stop button must end EVERYTHING the session set in motion: the visible
+# stream, any sibling server-side wakeup streams, the session's background
+# processes, and every queued/deferred wakeup — otherwise Stop is followed by
+# ghost turns (background completions re-waking the agent the user just
+# stopped). ``full_stop_session`` is called by /api/chat/cancel; the grace
+# window catches completion events that were already dequeued by the drain
+# thread when the stop landed.
+FULL_STOP_GRACE_SECS = 5.0
+_FULL_STOPPED_AT: dict[str, float] = {}
+_FULL_STOPPED_LOCK = threading.Lock()
+
+
+def _recently_full_stopped(session_id: str) -> bool:
+    with _FULL_STOPPED_LOCK:
+        ts = _FULL_STOPPED_AT.get(str(session_id or ""), 0.0)
+    return bool(ts) and (time.monotonic() - ts) < FULL_STOP_GRACE_SECS
+
+
+def full_stop_session(session_id: str) -> dict:
+    """End every background process and pending wakeup owned by *session_id*.
+
+    Order matters: stamp the grace window first (so in-flight ``_process_one``
+    events drop), then kill processes with notifications suppressed (agent
+    registry ``full_stop``), then purge the HWUI-side wakeup state — leaving
+    nothing for the turn-teardown idle-hook or next-turn drain to redeliver.
+    """
+    session_id = str(session_id or "").strip()
+    if not session_id:
+        return {}
+    from api import config as _cfg
+
+    now = time.monotonic()
+    with _FULL_STOPPED_LOCK:
+        _FULL_STOPPED_AT[session_id] = now
+        stale = [
+            sid for sid, ts in _FULL_STOPPED_AT.items()
+            if (now - ts) > (FULL_STOP_GRACE_SECS * 10)
+        ]
+        for sid in stale:
+            _FULL_STOPPED_AT.pop(sid, None)
+
+    summary = {"killed": 0, "purged": 0, "deferred_dropped": 0}
+
+    # Kill the session's background processes + purge their queued events in
+    # the agent's registry. WebUI-spawned processes carry the WebUI session_id
+    # as their spawn-time session_key (chat-start registers session_id →
+    # session_id in PROCESS_SESSION_INDEX); invert the index anyway to cover
+    # any aliased keys.
+    try:
+        from tools.process_registry import process_registry as _pr
+    except Exception:
+        _pr = None
+    if _pr is not None:
+        keys = {session_id}
+        try:
+            with _cfg.PROCESS_SESSION_INDEX_LOCK:
+                keys.update(
+                    k for k, v in _cfg.PROCESS_SESSION_INDEX.items()
+                    if str(v) == session_id
+                )
+        except Exception:
+            logger.debug("PROCESS_SESSION_INDEX invert failed", exc_info=True)
+        for key in keys:
+            try:
+                result = _pr.full_stop(key)
+                summary["killed"] += int(result.get("killed", 0))
+                summary["purged"] += int(result.get("purged", 0))
+            except Exception:
+                logger.warning(
+                    "process_registry.full_stop failed for key %r", key, exc_info=True
+                )
+
+    # Drop HWUI-side wakeup state: deferred prompts + the pending marker.
+    try:
+        with _cfg.DEFERRED_PROCESS_WAKEUPS_LOCK:
+            dropped = _cfg.DEFERRED_PROCESS_WAKEUPS.pop(session_id, []) or []
+        summary["deferred_dropped"] = len(dropped)
+    except Exception:
+        logger.debug("deferred-wakeup drop failed", exc_info=True)
+    try:
+        _cfg.PENDING_BG_TASK_COMPLETIONS.discard(session_id)
+    except Exception:
+        pass
+
+    logger.info(
+        "full stop for session %s: killed=%d purged=%d deferred_dropped=%d",
+        session_id,
+        summary["killed"],
+        summary["purged"],
+        summary["deferred_dropped"],
+    )
+    return summary
+
+
 def drain_deferred_wakeups_for_session(session_id: str) -> int:
     """Turn-teardown idle-hook: redeliver deferred wakeups once idle.
 
@@ -1138,6 +1241,11 @@ def drain_deferred_wakeups_for_session(session_id: str) -> int:
     if not session_id:
         return 0
     from api import config as _cfg
+
+    # AIP Full Stop: entries re-deferred by an in-flight wakeup racer during
+    # the stop's grace window must not be redelivered by this teardown.
+    if _recently_full_stopped(session_id):
+        return 0
 
     try:
         # Multi-stream guard: only fire when the session is TRULY idle.
@@ -1239,6 +1347,10 @@ def _start_server_side_wakeup_turn(
 ) -> None:
     """Start an agent turn server-side for a process_complete wakeup (Option Z).
 
+    AIP Full Stop gate (checked first below): a wakeup already routed/deferred
+    before the user's Stop landed must not start a turn during the grace
+    window — covers both callers (idle branch and teardown redelivery).
+
     Runs on a short-lived daemon thread so the drain loop NEVER blocks:
     ``start_session_turn`` itself spawns the agent worker thread, but does
     synchronous session-load / workspace / model resolution first, which must
@@ -1265,6 +1377,13 @@ def _start_server_side_wakeup_turn(
     claim in ``claim_deferred_wakeups`` is atomic, so re-queue can never cause
     a double delivery.
     """
+
+    if _recently_full_stopped(session_id):
+        logger.info(
+            "server-side wakeup suppressed: session %s was full-stopped",
+            session_id,
+        )
+        return
 
     def _runner() -> None:
         try:
