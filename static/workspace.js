@@ -1422,7 +1422,11 @@ async function uploadToWorkspace(file, dir) {
       method: 'POST',
       body: formData,
       headers: {},
-      timeoutMs: 120000,
+      // Large uploads are legitimate (backup archives up to the 512MB cap take
+      // many minutes on home uplinks, plus server-side extraction time) — a
+      // short timeout abandons the request client-side and the extraction
+      // outcome (incl. extract_error) is never shown to the user.
+      timeoutMs: 1800000,
     });
     if (data && data.error) {
       showToast(data.error, 5000, 'error');

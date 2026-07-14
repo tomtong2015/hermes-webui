@@ -41,6 +41,28 @@ def _max_extracted_bytes() -> int:
     return 10 * MAX_UPLOAD_BYTES
 
 
+def _max_archive_members() -> int:
+    """Archive member-count cap (inode-exhaustion guard).
+
+    Independently tunable via HERMES_WEBUI_MAX_ARCHIVE_MEMBERS; defaults to
+    200000. Legitimate workspace-backup archives routinely carry tens of
+    thousands of small files (agent sessions, skills, caches), so the guard
+    must sit well above real use while still bounding a malicious
+    million-member archive. Read at call time (not import) so the value
+    reflects the running process's environment and is exercisable by tests
+    against the out-of-process test server.
+    """
+    raw = os.getenv("HERMES_WEBUI_MAX_ARCHIVE_MEMBERS", "").strip()
+    if raw:
+        try:
+            n = int(float(raw))
+            if n > 0:
+                return n
+        except ValueError:
+            pass
+    return 200000
+
+
 # Back-compat module constant (some call sites / tests reference it). The
 # authoritative value is _max_extracted_bytes(), read at extraction time.
 _MAX_EXTRACTED_BYTES = 10 * MAX_UPLOAD_BYTES
@@ -223,41 +245,51 @@ def extract_archive(file_bytes: bytes, filename: str, workspace: Path):
     else:
         raise ValueError(f'Unsupported archive format: {filename}')
 
-    # Determine destination directory — use archive stem as folder name
-    dest_dir = safe_resolve_ws(workspace, stem)
-    # Avoid overwriting existing files by appending a suffix (bounded — astronomically
-    # unlikely to collide, but never spin forever).
-    if dest_dir.exists():
-        import string, random
-        for _ in range(1000):
-            if not dest_dir.exists():
-                break
-            suffix = ''.join(random.choices(string.digits, k=3))
-            dest_dir = safe_resolve_ws(workspace, stem).with_name(stem + '_' + suffix)
-        else:
-            raise ValueError('Could not allocate a unique extraction directory')
-    # #3398: create the extraction root race-safely under the true workspace root.
-    make_anchored_dir(workspace, dest_dir)
-
-    # Member-count cap: a tiny archive with millions of (possibly empty) members
-    # slips under the byte cap but can exhaust inodes / file descriptors. Bound it.
-    _MAX_ARCHIVE_MEMBERS = 10000
-
-    extracted_files = []
-    total_extracted = 0
-
+    # Parse the archive and enforce the member-count cap BEFORE creating the
+    # staging directory or writing anything: a cap violation (or a corrupt
+    # archive) must reject the whole upload without leaving a partial —
+    # and therefore misleading — staging dir behind. The old mid-flight
+    # count check extracted the first N members and then aborted, which
+    # real workspace-backup archives tripped in production.
+    if _mode == 'zip':
+        archive = zipfile.ZipFile(io.BytesIO(file_bytes))
+    else:
+        archive = tarfile.open(fileobj=io.BytesIO(file_bytes))
     try:
         if _mode == 'zip':
-            with zipfile.ZipFile(io.BytesIO(file_bytes)) as zf:
-                for member in zf.infolist():
-                    # Skip directories
-                    if member.is_dir():
-                        continue
-                    if len(extracted_files) >= _MAX_ARCHIVE_MEMBERS:
-                        raise ValueError(
-                            f'Archive has too many files (> {_MAX_ARCHIVE_MEMBERS}). '
-                            f'Possible archive bomb.'
-                        )
+            file_members = [m for m in archive.infolist() if not m.is_dir()]
+        else:
+            file_members = [m for m in archive.getmembers() if m.isfile()]
+        max_members = _max_archive_members()
+        if len(file_members) > max_members:
+            raise ValueError(
+                f'Archive has too many files ({len(file_members)} > {max_members}). '
+                f'Possible archive bomb. If this is a legitimate archive, raise '
+                f'HERMES_WEBUI_MAX_ARCHIVE_MEMBERS.'
+            )
+
+        # Determine destination directory — use archive stem as folder name
+        dest_dir = safe_resolve_ws(workspace, stem)
+        # Avoid overwriting existing files by appending a suffix (bounded — astronomically
+        # unlikely to collide, but never spin forever).
+        if dest_dir.exists():
+            import string, random
+            for _ in range(1000):
+                if not dest_dir.exists():
+                    break
+                suffix = ''.join(random.choices(string.digits, k=3))
+                dest_dir = safe_resolve_ws(workspace, stem).with_name(stem + '_' + suffix)
+            else:
+                raise ValueError('Could not allocate a unique extraction directory')
+        # #3398: create the extraction root race-safely under the true workspace root.
+        make_anchored_dir(workspace, dest_dir)
+
+        extracted_files = []
+        total_extracted = 0
+
+        try:
+            if _mode == 'zip':
+                for member in file_members:
                     # Zip-slip protection
                     member_path = (dest_dir / member.filename).resolve()
                     if not member_path.is_relative_to(dest_dir.resolve()):
@@ -274,7 +306,7 @@ def extract_archive(file_bytes: bytes, filename: str, workspace: Path):
                     # so no pathname member_path.parent.mkdir() before it (which
                     # could be redirected outside by a raced symlink component).
                     _mfd = open_anchored_create_fd(workspace, member_path)
-                    with zf.open(member) as src, os.fdopen(_mfd, 'wb', closefd=True) as dst:
+                    with archive.open(member) as src, os.fdopen(_mfd, 'wb', closefd=True) as dst:
                         _chunk_size = 65536
                         while True:
                             chunk = src.read(_chunk_size)
@@ -290,16 +322,8 @@ def extract_archive(file_bytes: bytes, filename: str, workspace: Path):
                             dst.write(chunk)
                     extracted_files.append(str(member_path.relative_to(workspace.resolve())))
 
-        elif _mode == 'tar':
-            with tarfile.open(fileobj=io.BytesIO(file_bytes)) as tf:
-                for member in tf.getmembers():
-                    if not member.isfile():
-                        continue
-                    if len(extracted_files) >= _MAX_ARCHIVE_MEMBERS:
-                        raise ValueError(
-                            f'Archive has too many files (> {_MAX_ARCHIVE_MEMBERS}). '
-                            f'Possible archive bomb.'
-                        )
+            elif _mode == 'tar':
+                for member in file_members:
                     # Tar-slip protection
                     member_path = (dest_dir / member.name).resolve()
                     if not member_path.is_relative_to(dest_dir.resolve()):
@@ -313,7 +337,7 @@ def extract_archive(file_bytes: bytes, filename: str, workspace: Path):
                         )
                     # #3398: anchored member create makes intermediate dirs
                     # race-safely; no pathname member_path.parent.mkdir() first.
-                    src_obj = tf.extractfile(member)
+                    src_obj = archive.extractfile(member)
                     if src_obj:
                         # #3398: fd-anchored member create under the TRUE workspace root.
                         _mfd = open_anchored_create_fd(workspace, member_path)
@@ -332,13 +356,28 @@ def extract_archive(file_bytes: bytes, filename: str, workspace: Path):
                                     )
                                 dst.write(chunk)
                     extracted_files.append(str(member_path.relative_to(workspace.resolve())))
-    except Exception:
-        # Clean up partially-extracted directory to avoid orphaned folders
-        try:
-            rmtree_anchored(workspace, dest_dir)
         except Exception:
-            pass
-        raise
+            # Clean up the partially-extracted directory to avoid orphaned
+            # folders. On NFS, an unlinked file that something still holds
+            # open leaves a .nfs* silly-rename entry that fails rmtree with
+            # ENOTEMPTY — retry once after a beat, and if the dir still
+            # survives, say so loudly: a silently-kept partial staging dir
+            # reads as a successful extraction to the user.
+            import time as _time
+            for _attempt in range(2):
+                try:
+                    rmtree_anchored(workspace, dest_dir)
+                except Exception:
+                    pass
+                if not dest_dir.exists():
+                    break
+                _time.sleep(0.5)
+            if dest_dir.exists():
+                print(f'[webui] WARNING: cleanup of partial extraction failed — '
+                      f'incomplete staging dir left at {dest_dir}', flush=True)
+            raise
+    finally:
+        archive.close()
 
     return {'extracted': len(extracted_files), 'files': extracted_files, 'dest': str(dest_dir)}
 
@@ -674,37 +713,35 @@ def handle_workspace_upload(handler):
                     })
                     continue
                 except (zipfile.BadZipFile, tarfile.TarError, ValueError) as e:
-                    # Extraction failed — remove the archive file (no partial
-                    # content left behind) and surface the error to the user.
-                    try:
-                        unlink_anchored(workspace, dest.resolve())
-                    except FileNotFoundError:
-                        pass
+                    # Extraction failed — KEEP the uploaded archive and surface
+                    # the error. Deleting it here destroys the user's only
+                    # pod-side copy, which is fatal in a backup-restore flow;
+                    # a kept archive can still be extracted manually (tar/unzip
+                    # in the terminal) after the guard that tripped is resolved.
                     print(f'[webui] workspace upload extract error: {e}', flush=True)
                     results.append({
                         'filename': safe_name,
-                        'path': str(target_dir),
+                        'path': str(dest),
                         'size': len(file_bytes),
                         'mime': mime,
                         'is_image': False,
                         'extracted': False,
-                        'extract_error': str(e) or 'Archive extraction failed',
+                        'archive_kept': True,
+                        'extract_error': (str(e) or 'Archive extraction failed')
+                                         + f' — uploaded archive kept as {dest.name}',
                     })
                     continue
                 except Exception:
                     print('[webui] workspace upload extract error: ' + _extract_tb.format_exc(), flush=True)
-                    try:
-                        unlink_anchored(workspace, dest.resolve())
-                    except FileNotFoundError:
-                        pass
                     results.append({
                         'filename': safe_name,
-                        'path': str(target_dir),
+                        'path': str(dest),
                         'size': len(file_bytes),
                         'mime': mime,
                         'is_image': False,
                         'extracted': False,
-                        'extract_error': 'Archive extraction failed',
+                        'archive_kept': True,
+                        'extract_error': f'Archive extraction failed — uploaded archive kept as {dest.name}',
                     })
                     continue
 
