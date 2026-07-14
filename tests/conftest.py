@@ -986,6 +986,10 @@ def test_server():
         # ~200MB — impractical to exceed in a test). 5MB is far above any other
         # test's archive payload, so only the bomb test trips it.
         "HERMES_WEBUI_MAX_EXTRACTED_MB":  "5",
+        # Member-count cap low enough to trip in a test (default 200000) but
+        # above the 10001-member regression archive that verifies real
+        # workspace-backup scale extracts fine.
+        "HERMES_WEBUI_MAX_ARCHIVE_MEMBERS": "12000",
         "HERMES_WEBUI_PORT":              str(TEST_PORT),
         "HERMES_WEBUI_HOST":              "127.0.0.1",
         "HERMES_WEBUI_STATE_DIR":         str(TEST_STATE_DIR),

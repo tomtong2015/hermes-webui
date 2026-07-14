@@ -682,8 +682,10 @@ class TestWorkspaceUploadArchive:
         assert result["extracted"] is False
         assert "extract_error" in result
 
-        # Corrupt archive file should be removed
-        assert not (ws / "corrupt.zip").exists()
+        # The uploaded archive is KEPT on extraction failure (deleting it
+        # destroyed the user's only pod-side copy — fatal for restore flows).
+        assert result.get("archive_kept") is True
+        assert (ws / "corrupt.zip").exists()
 
     def test_zip_bomb_cap_trips(self, cleanup_test_sessions):
         """When extraction exceeds the cap, it should be rejected and cleaned up.
@@ -716,22 +718,25 @@ class TestWorkspaceUploadArchive:
         assert result["extracted"] is False
         assert "extract_error" in result
 
-        # Archive should be removed on failure
-        assert not (ws / "bomb.zip").exists()
+        # Archive is kept on failure so the user can extract manually
+        assert result.get("archive_kept") is True
+        assert (ws / "bomb.zip").exists()
         # No partial extraction directory left behind
         assert not (ws / "bomb").exists()
 
     def test_archive_member_count_cap_trips(self, cleanup_test_sessions):
-        """An archive with too many members is rejected (inode-exhaustion guard).
+        """An archive over the member cap is rejected PRE-FLIGHT (inode guard).
 
-        The member cap (_MAX_ARCHIVE_MEMBERS = 10000) trips before the byte cap
-        when an archive packs a huge number of tiny files. Verifies the archive
-        and any partial extraction are cleaned up.
+        The test server runs with HERMES_WEBUI_MAX_ARCHIVE_MEMBERS=12000
+        (conftest; default 200000). The count check runs before the staging
+        dir is created, so a violation must leave NO partial extraction —
+        the old mid-flight check extracted the first 10k members and left a
+        misleading partial staging dir behind. The archive itself is kept.
         """
         sid, ws = make_session_tracked(cleanup_test_sessions)
 
-        # 10001 one-byte members — under the 5MB byte cap, over the 10k member cap.
-        members = {f"f{i}.txt": b"x" for i in range(10001)}
+        # 12001 one-byte members — under the 5MB byte cap, over the member cap.
+        members = {f"f{i}.txt": b"x" for i in range(12001)}
         zip_data = _make_zip(members)
 
         result, status = post_multipart(
@@ -743,8 +748,39 @@ class TestWorkspaceUploadArchive:
         assert status == 200, f"Upload failed {status}: {result}"
         assert result["extracted"] is False
         assert "extract_error" in result
-        assert not (ws / "many.zip").exists()
+        assert "12000" in result["extract_error"]
+        # Archive kept for manual extraction; NO staging dir at all.
+        assert result.get("archive_kept") is True
+        assert (ws / "many.zip").exists()
         assert not (ws / "many").exists()
+
+    def test_backup_scale_member_count_extracts(self, cleanup_test_sessions):
+        """Regression: a real workspace-backup-scale archive must extract fully.
+
+        The original 10000-member cap rejected legitimate backup tarballs
+        (a production workspace archive easily exceeds 10k files across agent
+        sessions/skills/caches) — and did so AFTER extracting the first 10k
+        members. 10001 members sits over that old cap and under the test
+        server's 12000 cap: extraction must succeed completely.
+        """
+        sid, ws = make_session_tracked(cleanup_test_sessions)
+
+        members = {f"d{i % 7}/f{i}.txt": b"x" for i in range(10001)}
+        zip_data = _make_zip(members)
+
+        result, status = post_multipart(
+            "/api/workspace/upload",
+            {"session_id": sid, "path": ""},
+            {"file": ("bigbackup.zip", zip_data)},
+        )
+
+        assert status == 200, f"Upload failed {status}: {result}"
+        assert result["extracted"] is True
+        assert result["extracted_count"] == 10001
+        # Archive removed after successful extraction; staging dir complete.
+        assert not (ws / "bigbackup.zip").exists()
+        extracted = sum(1 for p in (ws / "bigbackup").rglob("*") if p.is_file())
+        assert extracted == 10001
 
 
 # ── Hardening regression tests (v0.51.208 hotfix) ──────────────────────────
