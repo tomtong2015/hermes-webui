@@ -8824,6 +8824,7 @@ from api.upload import (
     handle_transcribe,
     handle_transcribe_capability,
     handle_workspace_upload,
+    handle_workspace_upload_status,
 )
 from api.streaming import (
     _sse,
@@ -12186,6 +12187,9 @@ def handle_get(handler, parsed) -> bool:
 
     if parsed.path == "/api/list":
         return _handle_list_dir(handler, parsed)
+
+    if parsed.path == "/api/workspace/upload-status":
+        return handle_workspace_upload_status(handler, parsed)
 
     if parsed.path == "/api/escape/list":
         return _handle_escape_list_dir(handler, parsed)
