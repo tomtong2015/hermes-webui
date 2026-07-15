@@ -754,6 +754,58 @@ class TestWorkspaceUploadArchive:
         assert (ws / "many.zip").exists()
         assert not (ws / "many").exists()
 
+    def test_async_extraction_pending_then_done(self, cleanup_test_sessions):
+        """extract_wait=0 forces the async path: pending + job id, then done.
+
+        Real archives extract for minutes while the proxy/edge in front of
+        the webui 504s any response silent for ~30s — extraction therefore
+        runs in a worker thread and the client polls
+        /api/workspace/upload-status. Verifies the pending response shape,
+        the job reaching 'done', complete extraction, and archive removal.
+        """
+        import time
+
+        sid, ws = make_session_tracked(cleanup_test_sessions)
+
+        members = {f"g{i}.txt": b"y" for i in range(1500)}
+        zip_data = _make_zip(members)
+
+        result, status = post_multipart(
+            "/api/workspace/upload",
+            {"session_id": sid, "path": "", "extract_wait": "0"},
+            {"file": ("bigasync.zip", zip_data)},
+        )
+
+        assert status == 200, f"Upload failed {status}: {result}"
+        # join(0) almost always leaves the job running; tolerate a fast finish.
+        if result["extracted"] == "pending":
+            job_id = result["extract_job"]
+            deadline = time.time() + 60
+            job = None
+            while time.time() < deadline:
+                job = get(f"/api/workspace/upload-status?job={job_id}")
+                if job.get("state") in ("done", "error"):
+                    break
+                time.sleep(0.5)
+            assert job and job.get("state") == "done", f"job did not finish: {job}"
+            assert job["extracted_count"] == 1500
+        else:
+            assert result["extracted"] is True
+            assert result["extracted_count"] == 1500
+
+        assert not (ws / "bigasync.zip").exists()
+        extracted = sum(1 for p in (ws / "bigasync").rglob("*") if p.is_file())
+        assert extracted == 1500
+
+    def test_upload_status_unknown_job_404(self, cleanup_test_sessions):
+        """Unknown job ids get a 404-shaped error, not a crash."""
+        import urllib.error
+        try:
+            get("/api/workspace/upload-status?job=doesnotexist")
+            assert False, "expected HTTP 404"
+        except urllib.error.HTTPError as e:
+            assert e.code == 404
+
     def test_backup_scale_member_count_extracts(self, cleanup_test_sessions):
         """Regression: a real workspace-backup-scale archive must extract fully.
 

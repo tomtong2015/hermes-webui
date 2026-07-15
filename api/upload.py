@@ -62,6 +62,53 @@ def _max_archive_members() -> int:
     return 200000
 
 
+def _extract_sync_wait_s() -> float:
+    """How long the workspace-upload handler waits inline for extraction.
+
+    Real archives (many thousand members onto NFS) extract for minutes, but
+    the proxy/edge chain in front of the webui gives up on a silent response
+    after ~30s — a synchronous handler can never deliver the outcome. So
+    extraction runs in a worker thread: the handler waits up to this many
+    seconds (small archives keep the immediate success/error response) and
+    otherwise answers `extracted: "pending"` + a job id the client polls via
+    /api/workspace/upload-status. Env: HERMES_WEBUI_EXTRACT_SYNC_WAIT_S.
+    """
+    raw = os.getenv("HERMES_WEBUI_EXTRACT_SYNC_WAIT_S", "").strip()
+    if raw:
+        try:
+            v = float(raw)
+            if v >= 0:
+                return min(v, 25.0)
+        except ValueError:
+            pass
+    return 15.0
+
+
+# In-memory registry of background extraction jobs (single-process server).
+# Bounded: finished jobs are pruned oldest-first past _EXTRACT_JOBS_MAX.
+_EXTRACT_JOBS: dict = {}
+_EXTRACT_JOBS_MAX = 50
+
+
+def _extract_jobs_put(job: dict) -> None:
+    _EXTRACT_JOBS[job['id']] = job
+    if len(_EXTRACT_JOBS) > _EXTRACT_JOBS_MAX:
+        finished = [j_ for j_ in _EXTRACT_JOBS.values() if j_['state'] != 'running']
+        finished.sort(key=lambda j_: j_.get('finished', 0))
+        for j_ in finished[:len(_EXTRACT_JOBS) - _EXTRACT_JOBS_MAX]:
+            _EXTRACT_JOBS.pop(j_['id'], None)
+
+
+def handle_workspace_upload_status(handler, parsed):
+    """Report the state of a background archive-extraction job."""
+    from urllib.parse import parse_qs
+    job_id = (parse_qs(parsed.query).get('job') or [''])[0]
+    job = _EXTRACT_JOBS.get(job_id)
+    if not job:
+        return j(handler, {'error': 'Unknown extraction job'}, status=404)
+    return j(handler, {k: v for k, v in job.items() if k != '_thread'})
+
+
 # Back-compat module constant (some call sites / tests reference it). The
 # authoritative value is _max_extracted_bytes(), read at extraction time.
 _MAX_EXTRACTED_BYTES = 10 * MAX_UPLOAD_BYTES
@@ -647,6 +694,16 @@ def handle_workspace_upload(handler):
         fields, files = parse_multipart(handler.rfile, content_type, content_length)
         session_id = fields.get('session_id', '')
         subpath = fields.get('path', '')
+        # Optional client override of the inline extraction wait (clamped to
+        # the same [0, 25]s range as the env default) — lets a client opt into
+        # an immediate pending response; also how tests exercise the async path.
+        extract_wait = _extract_sync_wait_s()
+        _wait_raw = str(fields.get('extract_wait', '')).strip()
+        if _wait_raw:
+            try:
+                extract_wait = max(0.0, min(float(_wait_raw), 25.0))
+            except ValueError:
+                pass
 
         if not session_id:
             return j(handler, {'error': 'Missing session_id'}, status=400)
@@ -732,30 +789,81 @@ def handle_workspace_upload(handler):
             is_archive = safe_name.lower().endswith(('.zip', '.tar', '.tar.gz', '.tgz', '.tar.bz2', '.tbz2', '.tar.xz', '.txz'))
             if is_archive:
                 import zipfile, tarfile, traceback as _extract_tb
-                try:
-                    extraction = extract_archive(file_bytes, safe_name, target_dir)
-                    # Remove the archive file after successful extraction
+                import threading, time as _time, uuid as _uuid
+
+                # Extraction runs in a worker thread: a big archive extracts
+                # for minutes (thousands of members onto NFS) while the
+                # proxy/edge in front of the webui 504s any response that is
+                # silent for ~30s. The handler waits _extract_sync_wait_s()
+                # inline — small archives keep the immediate outcome — and
+                # otherwise reports the job as pending for the client to poll
+                # via /api/workspace/upload-status.
+                job = {
+                    'id': _uuid.uuid4().hex[:12],
+                    'state': 'running',
+                    'filename': safe_name,
+                    'started': _time.time(),
+                }
+                _extract_jobs_put(job)
+                _dest_resolved = dest.resolve()
+
+                def _bg_extract(job=job, file_bytes=file_bytes, safe_name=safe_name,
+                                target_dir=target_dir, workspace=workspace,
+                                _dest_resolved=_dest_resolved, dest_name=dest.name):
                     try:
-                        unlink_anchored(workspace, dest.resolve())
-                    except FileNotFoundError:
-                        pass
+                        extraction = extract_archive(file_bytes, safe_name, target_dir)
+                        # Remove the archive file after successful extraction
+                        try:
+                            unlink_anchored(workspace, _dest_resolved)
+                        except FileNotFoundError:
+                            pass
+                        job.update({
+                            'state': 'done',
+                            'dest': extraction.get('dest', str(target_dir)),
+                            'extracted_count': extraction.get('extracted', 0),
+                            'extracted_files': extraction.get('files', []),
+                            'finished': _time.time(),
+                        })
+                    except (zipfile.BadZipFile, tarfile.TarError, ValueError) as e:
+                        # Extraction failed — KEEP the uploaded archive and
+                        # surface the error. Deleting it here destroys the
+                        # user's only pod-side copy, which is fatal in a
+                        # backup-restore flow; a kept archive can still be
+                        # extracted manually (tar/unzip in the terminal) after
+                        # the guard that tripped is resolved.
+                        print(f'[webui] workspace upload extract error: {e}', flush=True)
+                        job.update({
+                            'state': 'error',
+                            'archive_kept': True,
+                            'error': (str(e) or 'Archive extraction failed')
+                                     + f' — uploaded archive kept as {dest_name}',
+                            'finished': _time.time(),
+                        })
+                    except Exception:
+                        print('[webui] workspace upload extract error: ' + _extract_tb.format_exc(), flush=True)
+                        job.update({
+                            'state': 'error',
+                            'archive_kept': True,
+                            'error': f'Archive extraction failed — uploaded archive kept as {dest_name}',
+                            'finished': _time.time(),
+                        })
+
+                _th = threading.Thread(target=_bg_extract, daemon=True,
+                                       name=f'ws-extract-{job["id"]}')
+                _th.start()
+                _th.join(timeout=extract_wait)
+
+                if job['state'] == 'done':
                     results.append({
                         'filename': safe_name,
-                        'path': str(extraction.get('dest', target_dir)),
+                        'path': job['dest'],
                         'size': len(file_bytes),
                         'is_image': False,
                         'extracted': True,
-                        'extracted_files': extraction.get('files', []),
-                        'extracted_count': extraction.get('extracted', 0),
+                        'extracted_files': job['extracted_files'],
+                        'extracted_count': job['extracted_count'],
                     })
-                    continue
-                except (zipfile.BadZipFile, tarfile.TarError, ValueError) as e:
-                    # Extraction failed — KEEP the uploaded archive and surface
-                    # the error. Deleting it here destroys the user's only
-                    # pod-side copy, which is fatal in a backup-restore flow;
-                    # a kept archive can still be extracted manually (tar/unzip
-                    # in the terminal) after the guard that tripped is resolved.
-                    print(f'[webui] workspace upload extract error: {e}', flush=True)
+                elif job['state'] == 'error':
                     results.append({
                         'filename': safe_name,
                         'path': str(dest),
@@ -764,23 +872,19 @@ def handle_workspace_upload(handler):
                         'is_image': False,
                         'extracted': False,
                         'archive_kept': True,
-                        'extract_error': (str(e) or 'Archive extraction failed')
-                                         + f' — uploaded archive kept as {dest.name}',
+                        'extract_error': job['error'],
                     })
-                    continue
-                except Exception:
-                    print('[webui] workspace upload extract error: ' + _extract_tb.format_exc(), flush=True)
+                else:
                     results.append({
                         'filename': safe_name,
                         'path': str(dest),
                         'size': len(file_bytes),
                         'mime': mime,
                         'is_image': False,
-                        'extracted': False,
-                        'archive_kept': True,
-                        'extract_error': f'Archive extraction failed — uploaded archive kept as {dest.name}',
+                        'extracted': 'pending',
+                        'extract_job': job['id'],
                     })
-                    continue
+                continue
 
             sidecar = _write_office_upload_sidecar(workspace, dest, file_bytes)
             results.append({

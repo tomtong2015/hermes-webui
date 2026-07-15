@@ -1477,6 +1477,14 @@ async function uploadToWorkspace(file, dir) {
     });
     if (data && data.error) {
       showToast(data.error, 5000, 'error');
+    } else if (data && (data.extract_job || (Array.isArray(data.files) && data.files.some(function(f){return f && f.extract_job;})))) {
+      // Big archive: extraction continues server-side (a synchronous response
+      // would outlive the proxy/edge ~30s gateway timeout). Poll the job and
+      // report the real outcome; refresh the panel as content lands.
+      var jobId = data.extract_job
+        || (data.files.find(function(f){return f && f.extract_job;}) || {}).extract_job;
+      showToast(t('extracting_bg') || 'Archive uploaded — extracting in background…', 4000);
+      _pollExtractJob(jobId, file.name);
     } else if (data && (data.extract_error || (Array.isArray(data.files) && data.files.some(function(f){return f && f.extract_error;})))) {
       // Archive was rejected (zip-slip / zip-bomb / corrupt / too-many-members):
       // the file uploaded but extraction failed. Surface it as an error instead
@@ -1490,6 +1498,36 @@ async function uploadToWorkspace(file, dir) {
     }
   } catch (e) {
     showToast(t('upload_failed') || ('Upload failed: ' + e.message), 5000, 'error');
+  }
+}
+
+async function _pollExtractJob(jobId, fileName) {
+  if (!jobId) return;
+  // Poll every 5s for up to 60 min (large backup archives extract thousands
+  // of members onto NFS). Refresh the panel periodically so the user watches
+  // the staging dir fill in, and report the terminal outcome as a toast.
+  var started = Date.now();
+  while (Date.now() - started < 3600000) {
+    await new Promise(function(r){ setTimeout(r, 5000); });
+    var job = null;
+    try {
+      job = await api('/api/workspace/upload-status?job=' + encodeURIComponent(jobId));
+    } catch (e) {
+      continue; // transient — keep polling
+    }
+    if (!job || job.error === 'Unknown extraction job') return;
+    if (job.state === 'done') {
+      showToast((t('extracted') || 'Extracted ') + (fileName || '') +
+                ' (' + (job.extracted_count || 0) + ' files)', 5000);
+      if (S.session) loadDir(S.currentDir);
+      return;
+    }
+    if (job.state === 'error') {
+      showToast(job.error || 'Archive extraction failed', 10000, 'error');
+      if (S.session) loadDir(S.currentDir);
+      return;
+    }
+    if (S.session) loadDir(S.currentDir);
   }
 }
 
