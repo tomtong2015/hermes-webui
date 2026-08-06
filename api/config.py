@@ -9389,9 +9389,33 @@ def load_settings() -> dict:
         # Honor a stored True only when that marker is present.
         if not bool(stored.get("virtualize_transcript_optin")):
             settings["virtualize_transcript"] = False
+    # [AIP patch] Let SETTINGS_DEFAULTS survive when nothing is stored.
+    #
+    # `_read_raw_settings_file()` returns {} for a MISSING file, and {} is a
+    # dict — so the `isinstance(stored, dict)` arms below were always taken,
+    # `stored.get("theme")` was None, and `_normalize_appearance(None, None)`
+    # fell through to its unknown-theme branch: ("dark", "default"). The
+    # defaults dict was therefore unreachable for the exact case it exists to
+    # serve, a brand-new user. Upstream never notices because their defaults
+    # ARE dark/default; it only bites a deployment that changes them, i.e. AIP
+    # (light + poseidon). Confirmed in-pod: _SETTINGS_DEFAULTS said
+    # ('light','poseidon') while load_settings() returned ('dark','default').
+    #
+    # Gate on the PAIR, not per field. A per-field `or settings.get(...)`
+    # looks equivalent and is not: with a stored legacy theme and no skin,
+    # `slate` normalises to ("dark","slate"), but per-field fallback injects
+    # the default skin and yields ("dark","poseidon") — silently destroying
+    # the legacy migration. Same trap the client-side fix hit
+    # (hermes-webui#6808); this is its server-side twin.
+    #
+    # With any stored appearance this is behaviour-identical to upstream.
+    # Only the no-appearance case changes, which is the bug.
+    _has_stored_appearance = isinstance(stored, dict) and (
+        "theme" in stored or "skin" in stored
+    )
     settings["theme"], settings["skin"] = _normalize_appearance(
-        stored.get("theme") if isinstance(stored, dict) else settings.get("theme"),
-        stored.get("skin") if isinstance(stored, dict) else settings.get("skin"),
+        stored.get("theme") if _has_stored_appearance else settings.get("theme"),
+        stored.get("skin") if _has_stored_appearance else settings.get("skin"),
     )
     settings["default_model"] = get_effective_default_model()
     try:
