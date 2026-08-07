@@ -1483,7 +1483,16 @@ async function uploadToWorkspace(file, dir) {
       // report the real outcome; refresh the panel as content lands.
       var jobId = data.extract_job
         || (data.files.find(function(f){return f && f.extract_job;}) || {}).extract_job;
-      showToast(t('extracting_bg') || 'Archive uploaded — extracting in background…', 4000);
+      // [AIP] Deliberately a literal, not an i18n lookup with an `|| fallback`.
+      // That idiom is dead code here: the translate helper returns the KEY
+      // itself for an unknown key (see i18n.js, "final fallback: return key
+      // itself"), which is truthy, so the `||` never fires and the user is shown
+      // the raw key. These two toasts are AIP-only, so they carry their English
+      // text directly rather than adding untranslated keys to i18n.js, which
+      // churns heavily on every upstream port.
+      // NB: do not name the keys in prose either — tests/test_bugfix_sweep.py
+      // greps the raw file for lookup-shaped text and counts comments too.
+      showToast('Archive uploaded — extracting in background…', 4000);
       _pollExtractJob(jobId, file.name);
     } else if (data && (data.extract_error || (Array.isArray(data.files) && data.files.some(function(f){return f && f.extract_error;})))) {
       // Archive was rejected (zip-slip / zip-bomb / corrupt / too-many-members):
@@ -1517,7 +1526,8 @@ async function _pollExtractJob(jobId, fileName) {
     }
     if (!job || job.error === 'Unknown extraction job') return;
     if (job.state === 'done') {
-      showToast((t('extracted') || 'Extracted ') + (fileName || '') +
+      // [AIP] Literal for the same reason as the extracting toast above.
+      showToast('Extracted ' + (fileName || '') +
                 ' (' + (job.extracted_count || 0) + ' files)', 5000);
       if (S.session) loadDir(S.currentDir);
       return;
