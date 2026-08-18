@@ -70,6 +70,13 @@
   }
 })()</script>
 <link rel="stylesheet" href="static/style.css?v=__WEBUI_VERSION__">
+<!-- AIP: aip-tools extension assets as RELATIVE paths (resolve via the dynamic
+     <base href> above, so subpath mounts behind jupyter-server-proxy work).
+     The built-in extension injection renders configured URLs root-absolute
+     (/extensions/...), which skips the proxy prefix and 404s; served by the
+     sandboxed /extensions/ handler from HERMES_WEBUI_EXTENSION_DIR, and a
+     404 (extension dir unset) is harmless. -->
+<link rel="stylesheet" href="extensions/aip-tools/aip.css">
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css" integrity="sha384-LJcOxlx9IMbNXDqJ2axpfEQKkAYbFjJfhXexLfiRJhjDU81mzgkiQq8rkV0j6dVh" crossorigin="anonymous">
   <!-- KaTeX math rendering CSS (loaded eagerly from vendored assets to prevent font CSP noise) -->
   <link rel="stylesheet" href="static/vendor/katex/0.16.22/katex.min.css">
@@ -1765,6 +1772,9 @@
 <script src="static/onboarding.js?v=__WEBUI_VERSION__" defer></script>
 <script src="static/boot.js?v=__WEBUI_VERSION__" defer></script>
 <script src="static/outline.js?v=__WEBUI_VERSION__" defer></script>
+<!-- AIP: aip-tools buttons (Save/Restore, Skill Commons). Relative on purpose —
+     see the aip.css link in <head>. -->
+<script src="extensions/aip-tools/aip.js" defer></script>
 
 <!-- Kanban: create/rename board modal — used for both flows. -->
 <div class="kanban-modal-overlay" id="kanbanBoardModal" hidden onclick="if(event.target===this)closeKanbanBoardModal()">
